@@ -2,21 +2,30 @@ import os
 import sys
 import pickle
 import pathlib
-from tests.adapters import run_train_bpe
+import wandb
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from tests.adapters import run_train_bpe
 
 # 数据集路径
 DATA_DIR = pathlib.Path(__file__).resolve().parent.parent / "data"
-INPUT_PATH = os.path.join(DATA_DIR, "TinyStoriesV2-GPT4-train.txt")
+INPUT_PATH = os.path.join(DATA_DIR, "owt_train.txt")
 
 # Tokenizer保存路径
 TOKENIZER_DIR = pathlib.Path(__file__).resolve().parent.parent / "tokenizer"
-VOCAB_PATH = os.path.join(TOKENIZER_DIR, "tinystories_bpe_vocab.pkl")
-MERGES_PATH = os.path.join(TOKENIZER_DIR, "tinystories_bpe_merges.pkl")
+VOCAB_PATH = os.path.join(TOKENIZER_DIR, "owt_pe_vocab.pkl")
+MERGES_PATH = os.path.join(TOKENIZER_DIR, "owt_bpe_merges.pkl")
 
 # 训练参数
-vocab_size = 10_000
+vocab_size = 32_000
 special_tokens = ["<|endoftext|>"]
+
+wandb.init(project="transformer-lm", name="train-bpe-owt", config={
+    "vocab_size": vocab_size,
+    "special_tokens": special_tokens,
+    "input_path": str(INPUT_PATH),
+})
 
 # 训练
 vocab, merges = run_train_bpe(
@@ -35,4 +44,6 @@ with open(MERGES_PATH, "wb") as f:
 # 统计最长 token
 longest_token = max(vocab.values(), key=len)
 print("最长token:", longest_token, "长度:", len(longest_token))
+
+wandb.finish()
 

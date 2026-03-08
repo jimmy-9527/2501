@@ -1,0 +1,26 @@
+[project]
+name = "transformer-lm"
+version = "0.1.0"
+description = "A small Transformer language model"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "numpy",
+    "einops",
+    "einx",
+    "jaxtyping",
+    "regex",
+    "tqdm",
+    "wandb",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "psutil",
+    "tiktoken",
+    "ipython",
+]
+
+[tool.setuptools.packages.find]
+include = ["scripts*", "tests*"]

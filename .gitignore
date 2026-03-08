@@ -1,0 +1,18 @@
+# Data
+data/
+tokenizer/
+checkpoints/
+wandb/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# uv / venv
+.venv/
+uv.lock
+
+# OS
+.DS_Store

@@ -6,9 +6,12 @@ import pathlib
 import argparse
 import numpy as np
 from tqdm import tqdm
-from utils importt _to_device_and_compile
-from model import BasicsTransformerLM
+import wandb
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from utils import _to_device_and_compile
+from model import BasicsTransformerLM
 from tests.adapters import *
 
 DATA_DIR = pathlib.Path(__file__).resolve().parent.parent / "data"
@@ -55,6 +58,8 @@ def main():
 
     model, device = _to_device_and_compile(model)
 
+    wandb.init(project="transformer-lm", config=params)
+
     os.makedirs(args.save_path, exist_ok=True)
 
     # 2. 加载数据集
@@ -97,6 +102,8 @@ def main():
             param_group['lr'] = lr
         optimizer.step()
 
+        wandb.log({"train/loss": loss.item(), "train/lr": lr}, step=iteration)
+
         # 验证
         if (iteration+1) % args.val_interval == 0:
             model.eval()
@@ -116,12 +123,15 @@ def main():
                         break
                 val_loss_mean = np.mean(val_losses)
                 print(f"iter {iteration:05d}: VALID loss = {val_loss_mean:.4f}")
+                wandb.log({"val/loss": val_loss_mean}, step=iteration)
 
         # 保存
         if (iteration+1) % args.save_interval == 0:
             ckpt_name = os.path.join(args.save_path, f"ckpt_iter{iteration+1}.pt")
             run_save_checkpoint(model, optimizer, iteration+1, ckpt_name)
             print(f"Checkpoint saved to {ckpt_name}")
+
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

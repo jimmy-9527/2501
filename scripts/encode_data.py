@@ -2,7 +2,9 @@ import pickle
 import os
 import pathlib
 import sys
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from tests.adapters import Tokenizer
 import numpy as np
 from tqdm import tqdm
