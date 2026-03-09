@@ -1109,27 +1109,53 @@ def run_train_bpe(
             next_id += 1
 
     # Step 2: Pre-tokenization (streaming, line by line)
-    pre_tokens_cnt = defaultdict(int)
+   # Step 2: Pre-tokenize with parallel chunked processing
+    pre_tokens_cnt: Dict[Tuple[bytes, ...], int] = defaultdict(int)
 
-    def to_bytes_tuple(word: str) -> Tuple[bytes]:
-        l = list(tuple(word.encode("utf-8")))
-        l = [bytes([x]) for x in l]
-        return tuple(l)
+    split_special = special_tokens[0].encode("utf-8") if special_tokens else None
+    special_pattern = (
+        "(" + "|".join(map(re.escape, special_tokens)) + ")"
+        if special_tokens
+        else None
+    )
 
-    special_pattern = "|".join(map(re.escape, special_tokens)) if special_tokens else None
+    import multiprocessing as mp
+    import psutil
 
-    with open(input_path, "r", encoding="utf-8") as f:
-        text = f.read()
+    file_size = os.path.getsize(input_path)
+    num_workers = mp.cpu_count()
+    filepath = str(input_path)
 
-    if special_pattern:
-        chunks = re.split(special_pattern, text)
+    # Adapt chunk size to available memory.
+    # Each worker holds ~4x chunk size in memory (raw bytes + decoded str + regex overhead).
+    avail_mem = psutil.virtual_memory().available
+    mem_per_worker = avail_mem // (num_workers * 4) if num_workers else avail_mem // 4
+    # Clamp chunk size: at least 16MB (avoid too many tiny chunks), at most 512MB
+    chunk_bytes = max(16 * 1024 * 1024, min(mem_per_worker, 512 * 1024 * 1024))
+    num_chunks = max(num_workers, file_size // chunk_bytes + 1)
+
+    if split_special and file_size > 1_000_000:
+        boundaries = _find_chunk_boundaries(filepath, num_chunks, split_special)
+        chunk_args = [
+            (filepath, s, e, special_pattern)
+            for s, e in zip(boundaries[:-1], boundaries[1:])
+        ]
+        ctx = mp.get_context("fork")
+        with ctx.Pool(num_workers) as pool:
+            for local_counts in tqdm(
+                pool.imap(_pretokenize_chunk, chunk_args),
+                total=len(chunk_args),
+                desc="Pre-tokenizing",
+            ):
+                for key, cnt in local_counts.items():
+                    pre_tokens_cnt[key] += cnt
     else:
-        chunks = [text]
-
-    for chunk in tqdm(chunks, desc="Pre-tokenizing"):
-        for m in re.finditer(PAT, chunk):
-            word = m.group(0)
-            pre_tokens_cnt[to_bytes_tuple(word)] += 1
+        with open(input_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        for key, cnt in _pretokenize_chunk(
+            (filepath, 0, file_size, special_pattern)
+        ).items():
+            pre_tokens_cnt[key] += cnt
 
     # Step 3: Compute BPE Merges (incremental pair counting)
     merges = []
