@@ -1070,6 +1070,57 @@ class Tokenizer:
         return word
 
 
+def _find_chunk_boundaries(
+    filepath: str, num_chunks: int, split_token: bytes
+) -> List[int]:
+    """Find chunk boundaries aligned to special token positions."""
+    with open(filepath, "rb") as file:
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)
+        if file_size == 0:
+            return [0, 0]
+        chunk_size = file_size // num_chunks
+        boundaries = [i * chunk_size for i in range(num_chunks + 1)]
+        boundaries[-1] = file_size
+        mini = 4096
+        for bi in range(1, len(boundaries) - 1):
+            pos = boundaries[bi]
+            file.seek(pos)
+            while True:
+                data = file.read(mini)
+                if data == b"":
+                    boundaries[bi] = file_size
+                    break
+                idx = data.find(split_token)
+                if idx != -1:
+                    boundaries[bi] = pos + idx
+                    break
+                pos += mini
+        return sorted(set(boundaries))
+
+
+def _pretokenize_chunk(args: Tuple) -> Dict[Tuple[bytes, ...], int]:
+    """Pre-tokenize a file chunk, returning word counts."""
+    filepath, start, end, special_pattern = args
+    with open(filepath, "rb") as f:
+        f.seek(start)
+        raw = f.read(end - start)
+    text = raw.decode("utf-8", errors="ignore")
+    local_counts: Dict[Tuple[bytes, ...], int] = {}
+    if special_pattern:
+        parts = re.split(special_pattern, text)
+    else:
+        parts = [text]
+    for part in parts:
+        if special_pattern and re.fullmatch(special_pattern, part):
+            continue
+        for m in re.finditer(PAT, part):
+            key = tuple(bytes([b]) for b in m.group(0).encode("utf-8"))
+            local_counts[key] = local_counts.get(key, 0) + 1
+    return local_counts
+
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -1108,8 +1159,7 @@ def run_train_bpe(
             vocab[next_id] = token_bytes
             next_id += 1
 
-    # Step 2: Pre-tokenization (streaming, line by line)
-   # Step 2: Pre-tokenize with parallel chunked processing
+    # Step 2: Pre-tokenize with parallel chunked processing
     pre_tokens_cnt: Dict[Tuple[bytes, ...], int] = defaultdict(int)
 
     split_special = special_tokens[0].encode("utf-8") if special_tokens else None
