@@ -12,6 +12,7 @@ from torch import Tensor
 import numpy as np
 import regex as re
 import time
+from tqdm import tqdm
 
 ##### Helper functions #####
 
@@ -1107,7 +1108,7 @@ def run_train_bpe(
             vocab[next_id] = token_bytes
             next_id += 1
 
-    # Step 2: Pre-tokenization
+    # Step 2: Pre-tokenization (streaming, line by line)
     pre_tokens_cnt = defaultdict(int)
 
     def to_bytes_tuple(word: str) -> Tuple[bytes]:
@@ -1115,69 +1116,107 @@ def run_train_bpe(
         l = [bytes([x]) for x in l]
         return tuple(l)
 
+    special_pattern = "|".join(map(re.escape, special_tokens)) if special_tokens else None
+
     with open(input_path, "r", encoding="utf-8") as f:
         text = f.read()
-    
-    chunks = re.split("|".join(map(re.escape, special_tokens)), text)
-    
-    for chunk in chunks:
+
+    if special_pattern:
+        chunks = re.split(special_pattern, text)
+    else:
+        chunks = [text]
+
+    for chunk in tqdm(chunks, desc="Pre-tokenizing"):
         for m in re.finditer(PAT, chunk):
             word = m.group(0)
-            pre_tokens_cnt[to_bytes_tuple(word)] += 1   # key of pre_tokens_cnt e.g. (b'H', b'e', b'l', b'l', b'o')
+            pre_tokens_cnt[to_bytes_tuple(word)] += 1
 
-    # Step 3: Compute BPE Merges
+    # Step 3: Compute BPE Merges (incremental pair counting)
     merges = []
+    num_merges = vocab_size - len(vocab)
+
+    # Build initial pair counts and reverse index (pair -> set of words containing it)
+    pair_counts = defaultdict(int)
+    pair_to_words = defaultdict(set)
+    for token, cnt in pre_tokens_cnt.items():
+        for i in range(len(token) - 1):
+            pair = (token[i], token[i + 1])
+            pair_counts[pair] += cnt
+            pair_to_words[pair].add(token)
+
+    pbar = tqdm(total=num_merges, desc="BPE merges")
 
     while len(vocab) < vocab_size:
-        pair_counts = defaultdict(int)
-
-        # Count all adjacent byte pairs
-        for token, cnt in pre_tokens_cnt.items():
-            for i in range(len(token) - 1):
-                pair = (token[i], token[i + 1])
-                pair_counts[pair] += cnt
-
         if not pair_counts:
-            break  # No more pairs to merge
+            break
 
-        # Find the most frequent pair(s)
+        # Find the most frequent pair
         max_count = max(pair_counts.values())
         candidates = [k for k, v in pair_counts.items() if v == max_count]
         best_pair = max(candidates)
 
         a, b = best_pair
-
-        # Create new token
         new_token = a + b
         vocab[next_id] = new_token
         next_id += 1
 
-        # Apply the merge to all pre-tokenized sequences
-        # 收集变更
-        changes = []
-        for token, cnt in pre_tokens_cnt.items():
-            # Find all occurrences of the `best_pair` in `token`
-            indices = [i for i in range(len(token) - 1) if token[i:i + 2] == best_pair]
-            if indices:
-                # Replace each occurrence with `new_token`
-                new_pre_token = []
-                i = 0
-                while i < len(token):
-                    if i in indices:
-                        new_pre_token.append(new_token)
-                        i += 2
-                    else:
-                        new_pre_token.append(token[i])
-                        i += 1
-                new_pre_token = tuple(new_pre_token)
-                changes.append((token, new_pre_token, cnt))
+        # Get all words that contain this pair (copy since we'll mutate)
+        affected_words = list(pair_to_words.get(best_pair, []))
 
-        # 应用变更
-        for old_token, new_pre_token, cnt in changes:
-            pre_tokens_cnt[new_pre_token] = pre_tokens_cnt.get(new_pre_token, 0) + cnt
-            del pre_tokens_cnt[old_token]
+        for token in affected_words:
+            cnt = pre_tokens_cnt.get(token, 0)
+            if cnt == 0:
+                continue
 
-        # Record the merge
+            # Remove old pair counts for this word
+            for i in range(len(token) - 1):
+                old_pair = (token[i], token[i + 1])
+                pair_counts[old_pair] -= cnt
+                if pair_counts[old_pair] <= 0:
+                    del pair_counts[old_pair]
+                pair_to_words[old_pair].discard(token)
+
+            # Build new token sequence with the merge applied
+            new_word = []
+            i = 0
+            while i < len(token):
+                if i < len(token) - 1 and token[i] == a and token[i + 1] == b:
+                    new_word.append(new_token)
+                    i += 2
+                else:
+                    new_word.append(token[i])
+                    i += 1
+            new_word = tuple(new_word)
+
+            # If new_word already exists, remove its pair contributions first
+            existing_cnt = pre_tokens_cnt.get(new_word, 0)
+            if existing_cnt > 0 and new_word != token:
+                for i in range(len(new_word) - 1):
+                    p = (new_word[i], new_word[i + 1])
+                    pair_counts[p] -= existing_cnt
+                    if pair_counts[p] <= 0:
+                        del pair_counts[p]
+                    pair_to_words[p].discard(new_word)
+
+            # Update pre_tokens_cnt
+            del pre_tokens_cnt[token]
+            combined_cnt = existing_cnt + cnt
+            pre_tokens_cnt[new_word] = combined_cnt
+
+            # Add new pair counts for the combined count
+            for i in range(len(new_word) - 1):
+                new_pair = (new_word[i], new_word[i + 1])
+                pair_counts[new_pair] = pair_counts.get(new_pair, 0) + combined_cnt
+                pair_to_words[new_pair].add(new_word)
+
+        # Clean up the best_pair from index
+        if best_pair in pair_to_words:
+            del pair_to_words[best_pair]
+        if best_pair in pair_counts:
+            del pair_counts[best_pair]
+
         merges.append((a, b))
+        pbar.update(1)
 
+    pbar.close()
     return vocab, merges
