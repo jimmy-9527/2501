@@ -2,85 +2,126 @@ import pickle
 import os
 import pathlib
 import sys
+import re
+import multiprocessing as mp
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from tests.adapters import Tokenizer
+from scripts.utils import find_chunk_boundaries, compute_num_chunks
 import numpy as np
 from tqdm import tqdm
 
 TOKENIZER_DIR = pathlib.Path(__file__).resolve().parent.parent / "tokenizer"
-VOCAB_PATH = os.path.join(TOKENIZER_DIR, "tinystories_bpe_vocab.pkl")
-MERGES_PATH = os.path.join(TOKENIZER_DIR, "tinystories_bpe_merges.pkl")
+VOCAB_PATH = os.path.join(TOKENIZER_DIR, "owt_bpe_vocab.pkl")
+MERGES_PATH = os.path.join(TOKENIZER_DIR, "owt_bpe_merges.pkl")
 
 DATA_DIR = pathlib.Path(__file__).resolve().parent.parent / "data"
-TRAIN_TXT_DATA_PATH = os.path.join(DATA_DIR, "TinyStoriesV2-GPT4-train.txt")
-VAL_TXT_DATA_PATH = os.path.join(DATA_DIR, "TinyStoriesV2-GPT4-valid.txt")
+TRAIN_TXT_DATA_PATH = os.path.join(DATA_DIR, "owt_train.txt")
+VAL_TXT_DATA_PATH = os.path.join(DATA_DIR, "owt_valid.txt")
 TRAIN_DATA_PATH = os.path.join(DATA_DIR, "train.dat")
 VAL_DATA_PATH = os.path.join(DATA_DIR, "valid.dat")
 
 special_tokens = ["<|endoftext|>"]
 
-# 读取词表和merges
+# Load vocab and merges
 with open(VOCAB_PATH, 'rb') as f:
     vocab = pickle.load(f)
 with open(MERGES_PATH, 'rb') as f:
     merges = pickle.load(f)
 
-# 构造tokenizer
+# Build tokenizer
 tokenizer = Tokenizer(
     vocab=vocab,
     merges=merges,
     special_tokens=special_tokens
 )
 
-print("=== 测试 Tokenizer ===")
+print("=== Test Tokenizer ===")
 test_texts = [
     "Once upon a time, there was a little robot.",
     "Hello world! <|endoftext|> Some more text.",
     "<|endoftext|>",
-    "你好，世界！"
 ]
 
 for text in test_texts:
-    print(f"\n原文: {text}")
+    print(f"\nOriginal: {text}")
     encoded = tokenizer.encode(text)
-    print("编码:", encoded)
-
-    byte_tokens = [tokenizer.vocab[token_id] for token_id in encoded]
-    str_tokens = [b.decode("utf-8", errors="replace") for b in byte_tokens]
-    print("分词（可读）:", str_tokens)
-
+    print("Encoded:", encoded[:20], "..." if len(encoded) > 20 else "")
     decoded = tokenizer.decode(encoded)
-    print("解码:", decoded)
-    print("是否完全还原:", decoded == text)
+    print("Roundtrip OK:", decoded == text)
 
+
+def _encode_chunk(args):
+    """Encode a file chunk and return token IDs as a numpy array."""
+    filepath, start, end, vocab, merges, special_tokens, worker_id = args
+    tok = Tokenizer(vocab=vocab, merges=merges, special_tokens=special_tokens)
+    with open(filepath, "rb") as f:
+        f.seek(start)
+        raw = f.read(end - start)
+    text = raw.decode("utf-8", errors="ignore")
+
+    # Encode the full text (preserving newlines), show byte-level progress
+    chunk_size = end - start
+    pbar = tqdm(
+        total=chunk_size, unit="B", unit_scale=True,
+        desc=f"Worker {worker_id}", position=worker_id + 1,
+        leave=False, mininterval=1.0,
+    )
+    # Process in sub-chunks split on special tokens for progress granularity
+    special_pattern = (
+        "(" + "|".join(map(re.escape, special_tokens)) + ")"
+        if special_tokens else None
+    )
+    parts = re.split(special_pattern, text) if special_pattern else [text]
+    all_ids = []
+    for part in parts:
+        all_ids.extend(tok.encode(part))
+        pbar.update(len(part.encode("utf-8")))
+    pbar.close()
+    return np.array(all_ids, dtype=np.int32)
 
 
 def encode_txt_as_numpy_array(tokenizer, path_to_txt, save_path):
-    with open(path_to_txt, 'r') as f:
-        num_lines = sum(1 for _ in f)
-    
-    # 第一步：统计总token数（需要遍历一遍）
-    total_tokens = 0
-    with open(path_to_txt, 'r') as f:
-        for line in tqdm(f, total=num_lines, desc="Counting tokens"):
-            total_tokens += len(tokenizer.encode(line))
+    file_size = os.path.getsize(path_to_txt)
+    num_workers = mp.cpu_count()
+    filepath = str(path_to_txt)
+    split_token = special_tokens[0].encode("utf-8")
+    num_chunks = compute_num_chunks(file_size, num_workers)
 
-    # 第二步：创建memmap
-    dtype = np.int32
-    tokens_mm = np.memmap(save_path, dtype=dtype, mode='w+', shape=(total_tokens,))
+    if file_size > 1_000_000:
+        boundaries = find_chunk_boundaries(filepath, num_chunks, split_token)
+        chunk_args = [
+            (filepath, s, e, tokenizer.vocab, tokenizer.merges, special_tokens, i % num_workers)
+            for i, (s, e) in enumerate(zip(boundaries[:-1], boundaries[1:]))
+        ]
+        chunk_sizes = [e - s for s, e in zip(boundaries[:-1], boundaries[1:])]
 
-    # 第三步：再次遍历写入
-    pos = 0
-    with open(path_to_txt, 'r') as f:
-        for line in tqdm(f, total=num_lines, desc="Tokenizing"):
-            ids = tokenizer.encode(line)
-            n = len(ids)
-            tokens_mm[pos:pos+n] = ids
-            pos += n
+        results = []
+        ctx = mp.get_context("fork")
+        pbar = tqdm(total=file_size, unit="B", unit_scale=True,
+                    desc=f"Encoding {os.path.basename(path_to_txt)}")
+        with ctx.Pool(num_workers) as pool:
+            for i, token_arr in enumerate(pool.imap(_encode_chunk, chunk_args)):
+                results.append(token_arr)
+                pbar.update(chunk_sizes[i])
+        pbar.close()
+    else:
+        # Small file: single process
+        with open(path_to_txt, "r", encoding="utf-8") as f:
+            text = f.read()
+        results = [np.array(tokenizer.encode(text), dtype=np.int32)]
 
+    # Concatenate and write memmap
+    all_tokens = np.concatenate(results)
+    total_tokens = len(all_tokens)
+    print(f"  Total tokens: {total_tokens:,}")
+
+    tokens_mm = np.memmap(save_path, dtype=np.int32, mode='w+', shape=(total_tokens,))
+    tokens_mm[:] = all_tokens
     tokens_mm.flush()
+    print(f"  Saved to {save_path}")
+
 
 def main():
     encode_txt_as_numpy_array(tokenizer, TRAIN_TXT_DATA_PATH, TRAIN_DATA_PATH)

@@ -1070,54 +1070,39 @@ class Tokenizer:
         return word
 
 
-def _find_chunk_boundaries(
-    filepath: str, num_chunks: int, split_token: bytes
-) -> List[int]:
-    """Find chunk boundaries aligned to special token positions."""
-    with open(filepath, "rb") as file:
-        file.seek(0, os.SEEK_END)
-        file_size = file.tell()
-        file.seek(0)
-        if file_size == 0:
-            return [0, 0]
-        chunk_size = file_size // num_chunks
-        boundaries = [i * chunk_size for i in range(num_chunks + 1)]
-        boundaries[-1] = file_size
-        mini = 4096
-        for bi in range(1, len(boundaries) - 1):
-            pos = boundaries[bi]
-            file.seek(pos)
-            while True:
-                data = file.read(mini)
-                if data == b"":
-                    boundaries[bi] = file_size
-                    break
-                idx = data.find(split_token)
-                if idx != -1:
-                    boundaries[bi] = pos + idx
-                    break
-                pos += mini
-        return sorted(set(boundaries))
+from scripts.utils import find_chunk_boundaries, compute_num_chunks
 
 
 def _pretokenize_chunk(args: Tuple) -> Dict[Tuple[bytes, ...], int]:
     """Pre-tokenize a file chunk, returning word counts."""
-    filepath, start, end, special_pattern = args
+    filepath, start, end, special_pattern, worker_id = args
+    chunk_size = end - start
     with open(filepath, "rb") as f:
         f.seek(start)
-        raw = f.read(end - start)
+        raw = f.read(chunk_size)
     text = raw.decode("utf-8", errors="ignore")
     local_counts: Dict[Tuple[bytes, ...], int] = {}
+
     if special_pattern:
         parts = re.split(special_pattern, text)
     else:
         parts = [text]
+
+    # Show byte-level progress per worker
+    pbar = tqdm(
+        total=chunk_size, unit="B", unit_scale=True,
+        desc=f"Worker {worker_id}", position=worker_id + 1,
+        leave=False, mininterval=1.0,
+    )
     for part in parts:
         if special_pattern and re.fullmatch(special_pattern, part):
+            pbar.update(len(part.encode("utf-8")))
             continue
         for m in re.finditer(PAT, part):
             key = tuple(bytes([b]) for b in m.group(0).encode("utf-8"))
             local_counts[key] = local_counts.get(key, 0) + 1
+        pbar.update(len(part.encode("utf-8")))
+    pbar.close()
     return local_counts
 
 
@@ -1170,40 +1155,32 @@ def run_train_bpe(
     )
 
     import multiprocessing as mp
-    import psutil
 
     file_size = os.path.getsize(input_path)
     num_workers = mp.cpu_count()
     filepath = str(input_path)
-
-    # Adapt chunk size to available memory.
-    # Each worker holds ~4x chunk size in memory (raw bytes + decoded str + regex overhead).
-    avail_mem = psutil.virtual_memory().available
-    mem_per_worker = avail_mem // (num_workers * 4) if num_workers else avail_mem // 4
-    # Clamp chunk size: at least 16MB (avoid too many tiny chunks), at most 512MB
-    chunk_bytes = max(16 * 1024 * 1024, min(mem_per_worker, 512 * 1024 * 1024))
-    num_chunks = max(num_workers, file_size // chunk_bytes + 1)
+    num_chunks = compute_num_chunks(file_size, num_workers)
 
     if split_special and file_size > 1_000_000:
-        boundaries = _find_chunk_boundaries(filepath, num_chunks, split_special)
+        boundaries = find_chunk_boundaries(filepath, num_chunks, split_special)
         chunk_args = [
-            (filepath, s, e, special_pattern)
-            for s, e in zip(boundaries[:-1], boundaries[1:])
+            (filepath, s, e, special_pattern, i % num_workers)
+            for i, (s, e) in enumerate(zip(boundaries[:-1], boundaries[1:]))
         ]
+        chunk_sizes = [e - s for s, e in zip(boundaries[:-1], boundaries[1:])]
         ctx = mp.get_context("fork")
+        pbar = tqdm(total=file_size, unit="B", unit_scale=True, desc="Pre-tokenizing")
         with ctx.Pool(num_workers) as pool:
-            for local_counts in tqdm(
-                pool.imap(_pretokenize_chunk, chunk_args),
-                total=len(chunk_args),
-                desc="Pre-tokenizing",
-            ):
+            for i, local_counts in enumerate(pool.imap(_pretokenize_chunk, chunk_args)):
                 for key, cnt in local_counts.items():
                     pre_tokens_cnt[key] += cnt
+                pbar.update(chunk_sizes[i])
+        pbar.close()
     else:
         with open(input_path, "r", encoding="utf-8") as f:
             text = f.read()
         for key, cnt in _pretokenize_chunk(
-            (filepath, 0, file_size, special_pattern)
+            (filepath, 0, file_size, special_pattern, 0)
         ).items():
             pre_tokens_cnt[key] += cnt
 

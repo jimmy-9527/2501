@@ -15,8 +15,8 @@ from tests.adapters import Tokenizer
 
 # 1. 设定路径
 TOKENIZER_DIR = pathlib.Path(__file__).resolve().parent.parent / "tokenizer"
-VOCAB_PATH = os.path.join(TOKENIZER_DIR, "tinystories_bpe_vocab.pkl")
-MERGES_PATH = os.path.join(TOKENIZER_DIR, "tinystories_bpe_merges.pkl")
+VOCAB_PATH = os.path.join(TOKENIZER_DIR, "owt_bpe_vocab.pkl")
+MERGES_PATH = os.path.join(TOKENIZER_DIR, "owt_bpe_merges.pkl")
 special_tokens = ["<|endoftext|>"]
 
 # 2. 加载词表和 merges
